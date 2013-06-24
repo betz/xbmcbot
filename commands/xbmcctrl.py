@@ -2,41 +2,207 @@ import command, json, xbmc, re
 
 _DEBUG_JSON=False
 
+class FileIndex():
+  def __init__(self, command, media='video'):
+    self.media=media
+    self.pwd=['sources://']
+    self.tree=dict({self.getPwd():self.getSources(self.media)})
+    self.command=command
+
+  def getSources(self, media):
+    a=self.command.jsonrpc("Files.GetSources", {"media":str(media)})
+    if 'result' in a and 'sources' in a['result']:
+      return [dict(x.items()+[('filetype','directory')]) for x in a['result']['sources']]
+    return []
+
+  def getDirectory(self, path):
+    a=self.command.jsonrpc("Files.GetDirectory", {"directory":str(path)})
+    if 'result' in a and 'files' in a['result']:
+      return a['result']['files']
+    return []
+
+  def getFileList(self, match):
+    result=[]
+    for i in self.tree[self.getPwd()]: #check every entry in the dirlist
+      if 'label' in i and i['label'].lower().count(match.lower()): #if the name matches the search display it, empty match variables always match
+        if 'filetype' in i and i['filetype'] == 'directory': result.append("D %s" % i['label']) #if it was a directory append "D"
+        else: result.append("F %s" % i['label']) #otherwise it's a file and append "F"
+    return result
+
+  def getFileNames(self, match):
+    files=[]
+    for i in self.tree[self.getPwd()]: #check every entry in the dirlist
+      if 'label' in i and i['label'].count(match): files.append(i) #case sensitive first
+    for i in self.tree[self.getPwd()]: #check the list a second time
+      if 'label' in i and i['label'].lower().count(match.lower()): #time time case-insensitive
+        if i not in files: files.append(i) # append any files missed the first time
+    return files
+
+  def forceUpdate(self):
+    if len(self.pwd)<=1:
+      self.tree[self.getPwd()]=self.getSources(self.media)
+      return True
+    else:
+      del self.tree[self.getPwd()]
+      return self.changeDirectory(self.pwd.pop())
+
+  # current working path just a nice representation of the dir stack
+  def getPwd(self):
+    return str().join([self.pwd[0]]+[i+"/" for i in self.pwd if not i == 'sources://'])
+ 
+  # current dir is always the last item on the dir stack
+  def getCurrentDir(self):
+    return self.pwd[-1]
+
+  def changeDirectory(self, name):
+    result=None
+    # go through all items as long as no result is found, the item has a label and is a directory
+    for item in (x for x in self.tree[self.getPwd()] if not result and 'label' in x and x['filetype']=='directory'):
+      # if the item partially matches the name being changed to
+      if item['label'].count(name):
+        # check if the index has been chached
+        testpath=self.getPwd()+item['label']+"/"
+        if testpath in self.tree: result=self.tree[testpath]
+        # if not get a new index for this directory
+        else: result=self.getDirectory(item['file'])
+          
+    for item in (x for x in self.tree[self.getPwd()] if not result and 'label' in x and x['filetype']=='directory'):
+      # if the item partially matches the name being changed to (this time case-insensitive)
+      if item['label'].lower().count(name.lower()):
+        # check if the index has been chached
+        testpath=self.getPwd()+item['label']+"/"
+        if testpath in self.tree: result=self.tree[testpath]
+        # if not get a new index for this directory
+        else: result=self.getDirectory(item['file'])
+
+    # if a result was found, update the dir stack and maybe update the index
+    if result:
+      self.pwd.append(item['label'])
+      if not testpath in self.tree:
+        self.tree[self.getPwd()]=result
+    return result is not None
+
+  def up(self):
+    # if already at top level, don't try to go any higher
+    if len(self.pwd) <= 1: return False
+    # otherwise chop the last directory from the path, the index can be kept for later use
+    else: self.pwd.pop()
+    return True
+
+  def home(self):
+    self.pwd=self.pwd[:1]
+    return self.pwd[0]
+  
+
 class Command(command.Command):
   def localInit(self):
-    self.wd={u'file':u'sources://',u'type':u'unknown',u'filetype':u'directory',u'label':u'sources://'} #holds current directory we're in (working directory)
-    self.wdStack=[] #holds all previous directories
-    self.ls=[] #holds current directory listing
-    self.lsStack=[] #hold all previous directory listings
-    self.media="video" #media type to work with
-    self.more=[] #buffer for sending lines to the client
+    self.masters=dict()
 
   def fillhelp(self):
     self.desc=dict({'!help xbmcctrl':'this modules offers extended help for admins',
                      })
     self.help=dict({'ls':'returns a listing of the current directory you\'re browsing',
-                      'rels':'returns a directory listing without using the cached version',
-                      'say':'broadcasts a message to all admins and to the local xbmc instance',
-                      'more':'display the rest of the text buffer, if any',
-                      'cd':'changes into a directory (full match first, first partial match second)',
-                      'play':'plays a file (exact, fuzzy or url. in that order)',
-                      'pause':'pause/resume current playback',
-                      'stop':'stop all current playback',
-                      'time':'tells the current position in playback as well as total time',
-                      'seek':'skip to an absolute number of seconds or relative when using \'+\' or \'-\'',
-                      'up':'moves up one directory',
-                      'pwd':'lists current working path',
+                    'dir':'same as ls',
+                    'rels':'returns a directory listing without using the cached version',
+                    'cd':'changes into a directory (full match first, first partial match second)',
+                    'up':'moves up one directory',
+                    'pwd':'lists current working path',
+                    'play':'plays a file (exact, fuzzy or url. in that order)',
+                    'pause':'pause/resume current playback',
+                    'stop':'stop all current playback',
+                    'time':'tells the current position in playback as well as total time',
+                    'seek':'skip to an absolute number of seconds or relative when using \'+\' or \'-\'',
+                    'volume':'sets volume to something between 0 (mute) and 100',
+                    'mute':'sets volumet to 0',
+                    'zoom':'toggles between aspect ratios',
+                    'info':'displays info on current playing item on screen',
+                    'fullscreen':'hides or displays the fullscreen menu',
+                    'say':'broadcasts a message to all admins and to the local xbmc instance',
+                    'more':'display the rest of the text buffer, if any',
                      })
 
   def parsecommand(self, src, cmd, arg):
     nck=src.split('!')[0]
     if src in self.client.getAdmins():
+      
+      if not src in self.masters:
+        self.masters[src]=dict({'index':FileIndex(self),'buffer':[]})
+      
       if cmd == "ls" or cmd == "dir":
-        self.pushls(src, arg)
+        self.masters[src]['buffer']=self.masters[src]['index'].getFileList(arg)
+        self.pushmore(src)
 
       if cmd == "rels":
-        self.ls=[]
-        self.pushls(src, arg)
+        if self.masters[src]['index'].forceUpdate():
+          self.masters[src]['buffer']=self.masters[src]['index'].getFileList(arg)
+        else: self.masters[src]['buffer']=['Failed to get a file listing']
+        self.pushmore(src)
+
+      if cmd == "cd":
+        if len(arg)<=0: success = self.masters[src]['index'].home()
+        elif arg == "..": success = self.masters[src]['index'].up()
+        else: success = self.masters[src]['index'].changeDirectory(arg)
+        if success: self.masters[src]['buffer']=["Changed directory to %s" % self.masters[src]['index'].getCurrentDir()]
+        else: self.masters[src]['buffer']=["Failed to change directory"]
+        self.pushmore(src)
+
+      if cmd == "up" or cmd == "cd..":
+        if self.masters[src]['index'].up(): self.masters[src]['buffer']=["Changed directory to %s" % self.masters[src]['index'].getCurrentDir()]
+        else: self.masters[src]['buffer']=["Failed to change directory"]
+        self.pushmore(src)
+
+      if cmd == "pwd":
+        self.masters[src]['buffer']=["Current path: %s" % self.masters[src]['index'].getPwd()]
+        self.pushmore(src)
+
+      if cmd == "play":
+        if len(arg)<=0:
+          if self.pause(arg):
+            self.masters[src]['buffer']=["Pause/Resume all playback"]
+            self.localNotify("%s toggled Pause/Resume" % nck)
+          else: self.masters[src]['buffer']=["Failed to Pause/Resume playback"]
+        else:
+          result=self.open(arg, self.masters[src]['index'])
+          if result:
+            self.masters[src]['buffer']=["Playing %s" % result]
+            self.localNotify("%s started playing %s" % (nck,result))
+          else: self.masters[src]['buffer']=["Failed playing %s" % arg]
+        self.pushmore(src)
+
+      if cmd == "pause":
+        if self.pause(arg):
+          self.masters[src]['buffer']=["Pause/Resume all playback"]
+          self.localNotify("%s toggled Pause/Resume" % nck)
+        else: self.masters[src]['buffer']=["Failed to Pause/Resume playback"]
+        self.pushmore(src)
+
+      if cmd == "stop":
+        type=self.stop(arg)
+        if type:
+          self.masters[src]['buffer']=["%s playback stopped" % type]
+          self.localNotify("%s stopped %s playback" % (nck,type))
+        else: self.masters[src]['buffer']=["Failed to stop playback"]
+        self.pushmore(src)
+
+      if cmd == "time":
+        a=self.time(arg)
+        if a: self.masters[src]['buffer']=[a]
+        else: self.masters[src]['buffer']=["Error retrieving time"]
+        self.pushmore(src)
+
+      if cmd == "seek":
+        if len(arg)>0 and self.seek(arg): self.masters[src]['buffer']=["Skipped to %s seconds" % arg]
+        else: self.masters[src]['buffer']=["Unable to skip to %s seconds" % arg]
+        self.pushmore(src)
+
+      if cmd == "volume":
+        if len(arg)>0 and self.volume(arg): self.masters[src]['buffer']=["Set volume to %s" % arg]
+        else: self.masters[src]['buffer']=["Unable to set volume to %s" % arg]
+        self.pushmore(src)
+
+      if cmd == "mute":
+        if self.volume("0"): self.masters[src]['buffer']=["Toggled mute/unmute"]
+        else: self.masters[src]['buffer']=["Failed to toggle mute/unmute"]
 
       if cmd == "say":
         self.localNotify("%s says: %s" % (nck,arg))
@@ -45,159 +211,64 @@ class Command(command.Command):
       if cmd == "more":
         self.pushmore(src)
 
-      if cmd == "cd":
-        self.more=[]
-        if arg == "..":
-          if self.up(): self.more.append("Changed directory to %s" % self.wd['label'])
-          else: self.more.append("Failed to change directory, already in root")
-        else:
-          if not len(self.ls): self.getls()
-          if self.changeDirectory(arg):
-            pwd=self.wd['label']
-            self.more.append("Changed directory to %s" % pwd)
-          else: self.more.append("Failed to find directory matching %s" % arg)
-        self.pushmore(src)
+      if cmd == "zoom":
+        success=False
+        if arg.isdigit: x=arg
+        else: x=1
+        for i in xrange(x):
+          if self.executeAction("aspectratio"): success=True
+        if success: self.masters[src]['buffer']=["Toggled aspect ratio"]
+        else: self.masters[src]['buffer']=["Failed to toggle aspect ratio"]
 
-      if cmd == "play" and not arg=="":
-        self.more=[]
-        result=self.open(arg)
-        if result:
-          self.more.append("Playing %s" % result)
-          self.localNotify("%s started playing %s" % (nck,result))
-        else: self.more.append("Failed playing %s" % arg)
-        self.pushmore(src)
+      if cmd == "info":
+        if self.executeAction("info"): self.masters[src]['buffer']=["Toggled info"]
+        else: self.masters[src]['buffer']=["Failed to toggle info"]
 
-      if cmd == "download":
-        self.more=[]
-        result=self.getDownload(arg)
+      if cmd == "fullscreen":
+        if self.executeAction("fullscreen"): self.masters[src]['buffer']=["Toggled fullscreen display"]
+        else: self.masters[src]['buffer']=["Failed to fullscreen display"]
 
-      if cmd == "pause":
-        self.more=[]
-        if self.pause(arg):
-          self.more.append("Pause/Resume all playback")
-          self.localNotify("%s toggled Pause/Resume" % nck)
-        else: self.more.append("Failed to Pause/Resume playback")
-        self.pushmore(src)
-
-      if cmd == "stop":
-        self.more=[]
-        type=self.stop(arg)
-        if type:
-          self.more.append("%s playback stopped" % type)
-          self.localNotify("%s stopped %s playback" % (nck,type))
-        else: self.more.append("Failed to stop playback")
-        self.pushmore(src)
-
-      if cmd == "time":
-        self.more=[]
-        a=self.time(arg)
-        if a: self.more.append(a)
-        else: self.more.append("Error retrieving time")
-        self.pushmore(src)
-
-      if cmd == "seek":
-        self.more=[]
-        if self.seek(arg): self.more.append("Skipped to %s seconds" % arg)
-        else: self.more.append("Unable to skip to %s seconds" % arg)
-        self.pushmore(src)
-
-      if cmd == "up":
-        self.more=[]
-        if self.up(): self.more.append("Changed directory to %s" % self.wd['label'])
-        else: self.more.append("Failed to change directory, already in root")
-        self.pushmore(src)
-
-      if cmd == "pwd":
-        tpath=""; self.more=[]
-        for i in xrange(len(self.wdStack)):
-          tpath+=self.wdStack[i]['label']+"/"
-          if i<1: tpath=tpath[:-1]
-        self.more.append("Current path: %s" % tpath+self.wd['label'])
-        self.pushmore(src)
-
-      if cmd == "built-in":
+      # Dangerous unchecked functions which should only be available when debuggin is turned on
+      if cmd == "built-in" and self.client.debug:
         result=xbmc.executebuiltin(arg)
         if result:
-          self.more=[]
-          self.more.append(str(result))
+          self.masters[src]['buffer']=[str(result)]
           self.pushmore(src)
-          return True
-        return False
+      
+      if cmd == "json-rpc" and self.client.debug:
+        method=str().join(arg.split(None,1)[:1])
+        params=str().join(arg.split(None,1)[1:])
+        if len(params)>0: result=self.jsonrpc(method, json.loads(params))
+        else: result=self.jsonrpc(method)
+        if result:
+          self.masters[src]['buffer']=[str(result)]
+          self.pushmore(src)
 
   def jsonrpc(self, method, params=None):
-    result={}
     q={"jsonrpc":"2.0", "id":None, "method":method}
     if params: q["params"]=params
-    if _DEBUG_JSON: self.client.log(json.dumps(q))
+    if _DEBUG_JSON: self.client.log("QUERY: "+json.dumps(q))
     try: result=xbmc.executeJSONRPC(json.dumps(q))
-    except: pass
-    if _DEBUG_JSON: self.client.log(result)
+    except: result={}
+    if _DEBUG_JSON: self.client.log("ANSWER: "+result)
     return json.loads(result)
 
-  def getSources(self, media):
-    a=self.jsonrpc("Files.GetSources", {"media":str(media)})
-    if 'result' in a and 'sources' in a['result']:
-      return a['result']['sources']
-    return {}
-
-  def getDirectory(self, path):
-    a=self.jsonrpc("Files.GetDirectory", {"directory":str(path)})
-    if 'result' in a and 'files' in a['result']:
-      return a['result']['files']
-    return {}
-
-  def getDownload(self, name):
-    for i in self.ls:
-      if 'label' in i and i['label'].lower().count(name.lower()):
-        print self.jsonrpc("Files.Download", {'path':i['file']})
-        return True
-    return False
+  def executeAction(self, action):
+    if 'error' in self.jsonrpc("Input.ExecuteAction", {"action":action}): return False
+    return True
   
-  def getls(self):
-    if self.wd['label']=='sources://':
-      a=self.getSources(self.media)
-      for i in a:
-        i[u'filetype']=u'directory'
-        i[u'type']=u'unknown'
-      self.ls=a
-      return a
-    else:
-      a=self.getDirectory(self.wd['file'])
-      self.ls=a
-      return a
-
-  def changeDirectory(self, name):
-    if not len(self.ls): self.getls()
-    result=None
-    for i in (x for x in self.ls if not result):
-      if 'label' in i and i['filetype'] == 'directory':
-        if i['label'].count(name): result=self.getDirectory(i['file'])
-    for i in (x for x in self.ls if not result):
-      if 'label' in i and i['filetype'] == 'directory':
-        if i['label'].lower().count(name.lower()): result=self.getDirectory(i['file'])
-    if result:
-      self.wdStack.append(self.wd)
-      self.lsStack.append(self.ls)
-      self.wd=i
-      self.ls=result
-    return result
-
-  def open(self, name):
+  def open(self, name, index):
     # see if we can match a youtube url, if so open video id with plugin
     youtube_re=re.compile('(https?://)?(www\.)?youtube\..*?v=(?P<id>[\w-]+)\?*.*')
     if youtube_re.match(name): return self.openyoutube(youtube_re.match(name).groupdict()['id'])
-
-    # try and find a matching filename
-    for i in (x for x in self.ls if 'label' in x):
-      # try to do an exact match first
-      if i['label'].count(name):
-        if self.openurl(i['file']): return i['label']
-    for i in (x for x in self.ls if 'label' in x):
-      # try and no a case insensitive match next
-      if i['label'].lower().count(name.lower()):
-        if self.openurl(i['file']): return i['label']
+    indexmatches=index.getFileNames(name)
+    if len(indexmatches)>0:
+      for i in indexmatches:
+        if 'filetype' in i and i['filetype']=='directory':
+          if self.opendir(i['file']): return i['label']
+        elif self.openfile(i['file']): return i['label']
     # if all fails, try to open it as an URL and return the results
-    return self.openurl(name)
+    return self.openfile(name)
 
   def openyoutube(self, id):
     xbmc.log("XBMCBot:: playing YouTube ID %s" % id)
@@ -205,9 +276,14 @@ class Command(command.Command):
     xbmc.executebuiltin("PlayMedia(%s)" % file)
     return "YouTube ID: %s" % id
 
-  def openurl(self, url):
-    a=self.jsonrpc("Player.Open",{'item':{'file':url}})
-    if not 'error' in a: return url
+  def openfile(self, name):
+    a=self.jsonrpc("Player.Open",{'item':{'file':name}})
+    if not 'error' in a: return name
+    return False
+
+  def opendir(self, name):
+    a=self.jsonrpc("Player.Open",{'item':{'directory':name}})
+    if not 'error' in a: return name
     return False
 
   def getCurrentPlayer(self, type):
@@ -249,6 +325,19 @@ class Command(command.Command):
       if 'error' in result: return False
       return type
     return False
+
+  def volume(self, vol):
+    # return error if input is not absolute or relative value
+    try: vol=int(vol)
+    except: return False
+    if vol<=0: return self.mute()
+    elif not self.mute(False): return False
+    else: return 'error' not in self.jsonrpc("Application.SetVolume",{'volume':int(vol)})
+  
+  def mute(self, toggle=True):
+    if 'error' in self.jsonrpc("Application.SetMute",{'mute':False}): return False
+    elif toggle: return 'error' not in self.jsonrpc("Application.SetMute",{'mute':True})
+    return True
 
   def seek(self, secs):
     # return error if input is not absolute or relative value
@@ -297,13 +386,6 @@ class Command(command.Command):
       return "%s/%s (%s)" % (curstr,totstr,perstr)
     return False
 
-  def up(self):
-    if not len(self.wdStack): return False
-    else:
-      self.wd=self.wdStack.pop()
-      self.ls=self.lsStack.pop()
-      return True
-
   def getProperties(self, playerid):
     a=self.jsonrpc("Player.GetProperties",{'playerid':playerid,'properties':['canrepeat','canmove','canshuffle','speed','percentage','playlistid','audiostreams','position','repeat','currentsubtitle','canrotate','canzoom','canchangespeed','type','partymode','subtitles','canseek','time','totaltime','shuffled','currentaudiostream','live','subtitleenabled']})
     if 'error' in a: return False
@@ -330,20 +412,11 @@ class Command(command.Command):
     totint=(totstr['hours']*3600)+(totstr['minutes']*60)+totstr['seconds']
     return totint
 
-  def pushls(self, src, arg):
-    if not len(self.ls): self.getls() #refresh current directory listing if empty
-    self.more=[] #clear more
-    for i in self.ls: #check every entry in the dirlist
-      if 'label' in i and i['label'].lower().count(arg.lower()): #if the name matches the search display it, if search is empty it always matches
-        if 'filetype' in i and i['filetype'] == 'directory': self.more.append("D %s" % i['label']) #if it was a directory append "D"
-        else: self.more.append("F %s" % i['label']) #otherwise it's a file and append "F"
-    self.pushmore(src) #get started on printing the first part of the buffer
-
   def pushmore(self, src):
     for i in xrange(10):
-      if len(self.more):
-        self.client.sendPrivateReply(src, self.more.pop(0), True)
-    if len(self.more):
+      if len(self.masters[src]['buffer']):
+        self.client.sendPrivateReply(src, self.masters[src]['buffer'].pop(0), True)
+    if len(self.masters[src]['buffer']):
       self.client.sendPrivateReply(src, "type 'more' for more", True)
 
   def remoteNotify(self, message):

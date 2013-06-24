@@ -1,31 +1,22 @@
 import command, json, xbmc, re
 
-_DEBUG_JSON=True
+_DEBUG_JSON=False
 
 class FileIndex():
-  def __init__(self, media='video'):
+  def __init__(self, command, media='video'):
     self.media=media
     self.pwd=['sources://']
     self.tree=dict({self.getPwd():self.getSources(self.media)})
-
-  def jsonrpc(self, method, params=None):
-    result={}
-    q={"jsonrpc":"2.0", "id":None, "method":method}
-    if params: q["params"]=params
-    if _DEBUG_JSON: print(json.dumps(q))
-    try: result=xbmc.executeJSONRPC(json.dumps(q))
-    except: pass
-    if _DEBUG_JSON: print(result)
-    return json.loads(result)
+    self.command=command
 
   def getSources(self, media):
-    a=self.jsonrpc("Files.GetSources", {"media":str(media)})
+    a=self.command.jsonrpc("Files.GetSources", {"media":str(media)})
     if 'result' in a and 'sources' in a['result']:
       return [dict(x.items()+[('filetype','directory')]) for x in a['result']['sources']]
     return []
 
   def getDirectory(self, path):
-    a=self.jsonrpc("Files.GetDirectory", {"directory":str(path)})
+    a=self.command.jsonrpc("Files.GetDirectory", {"directory":str(path)})
     if 'result' in a and 'files' in a['result']:
       return a['result']['files']
     return []
@@ -135,7 +126,7 @@ class Command(command.Command):
     if src in self.client.getAdmins():
       
       if not src in self.masters:
-        self.masters[src]=dict({'index':FileIndex(),'buffer':[]})
+        self.masters[src]=dict({'index':FileIndex(self),'buffer':[]})
       
       if cmd == "ls" or cmd == "dir":
         self.masters[src]['buffer']=self.masters[src]['index'].getFileList(arg)
@@ -221,7 +212,12 @@ class Command(command.Command):
         self.pushmore(src)
 
       if cmd == "zoom":
-        if self.executeAction("aspectratio"): self.masters[src]['buffer']=["Toggled aspect ratio"]
+        success=False
+        if arg.isdigit: x=arg
+        else: x=1
+        for i in xrange(x):
+          if self.executeAction("aspectratio"): success=True
+        if success: self.masters[src]['buffer']=["Toggled aspect ratio"]
         else: self.masters[src]['buffer']=["Failed to toggle aspect ratio"]
 
       if cmd == "info":
@@ -233,7 +229,6 @@ class Command(command.Command):
         else: self.masters[src]['buffer']=["Failed to fullscreen display"]
 
       # Dangerous unchecked functions which should only be available when debuggin is turned on
-
       if cmd == "built-in" and self.client.debug:
         result=xbmc.executebuiltin(arg)
         if result:
@@ -250,13 +245,12 @@ class Command(command.Command):
           self.pushmore(src)
 
   def jsonrpc(self, method, params=None):
-    result={}
     q={"jsonrpc":"2.0", "id":None, "method":method}
     if params: q["params"]=params
-    if _DEBUG_JSON: self.client.log(json.dumps(q))
+    if _DEBUG_JSON: self.client.log("QUERY: "+json.dumps(q))
     try: result=xbmc.executeJSONRPC(json.dumps(q))
-    except: pass
-    if _DEBUG_JSON: self.client.log(result)
+    except: result={}
+    if _DEBUG_JSON: self.client.log("ANSWER: "+result)
     return json.loads(result)
 
   def executeAction(self, action):
